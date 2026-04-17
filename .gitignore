@@ -1,0 +1,27 @@
+# Dépendances
+node_modules/
+
+# Variables d'environnement
+.env
+.env.*
+!.env.example
+
+# Données persistantes
+data/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# Système
+.DS_Store
+Thumbs.db
+
+# Éditeurs
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.suo
+*.sw?
