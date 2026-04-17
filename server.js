@@ -228,7 +228,25 @@ const server = createServer(async (req, res) => {
 
   try {
     if (req.method === 'GET' && url.pathname === '/api/health') {
-      sendJson(res, 200, { ok: true, database: 'connected' }, origin);
+      try {
+        await mongoClient.db().command({ ping: 1 });
+        const guestCount = await guestsCollection.countDocuments();
+        sendJson(res, 200, {
+          ok: true,
+          uptime: Math.floor(process.uptime()),
+          timestamp: new Date().toISOString(),
+          database: { status: 'connected', guests: guestCount },
+          sessions: { active: sessions.size },
+        }, origin);
+      } catch (dbError) {
+        sendJson(res, 503, {
+          ok: false,
+          uptime: Math.floor(process.uptime()),
+          timestamp: new Date().toISOString(),
+          database: { status: 'unreachable', error: dbError.message },
+          sessions: { active: sessions.size },
+        }, origin);
+      }
       return;
     }
 
