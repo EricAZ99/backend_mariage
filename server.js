@@ -164,6 +164,19 @@ function sanitizeGuestPayload(payload, { partial = false } = {}) {
   return next;
 }
 
+function normalizeComparableText(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ');
+}
+
+function normalizePhone(value) {
+  return String(value || '').replace(/[^\d+]/g, '');
+}
+
 function createGuest(payload) {
   const guest = sanitizeGuestPayload(payload);
   if (!guest.firstName || !guest.lastName) {
@@ -177,6 +190,95 @@ function createGuest(payload) {
     createdAt: new Date().toISOString(),
     checkInStatus: 'not_arrived',
   };
+}
+
+function isDuplicateGuest(candidate, existingGuest) {
+  const candidateFirstName = normalizeComparableText(candidate.firstName);
+  const candidateLastName = normalizeComparableText(candidate.lastName);
+  const candidateEmail = normalizeComparableText(candidate.email);
+  const candidatePhone = normalizePhone(candidate.phone);
+
+  const existingFirstName = normalizeComparableText(existingGuest.firstName);
+  const existingLastName = normalizeComparableText(existingGuest.lastName);
+  const existingEmail = normalizeComparableText(existingGuest.email);
+  const existingPhone = normalizePhone(existingGuest.phone);
+
+  const sameIdentity = candidateFirstName === existingFirstName && candidateLastName === existingLastName;
+  const sameEmail = candidateEmail && existingEmail && candidateEmail === existingEmail;
+  const samePhone = candidatePhone && existingPhone && candidatePhone === existingPhone;
+
+  return sameIdentity || sameEmail || samePhone;
+}
+
+function formatDuplicateReason(candidate, existingGuest) {
+  const candidateEmail = normalizeComparableText(candidate.email);
+  const candidatePhone = normalizePhone(candidate.phone);
+  const existingEmail = normalizeComparableText(existingGuest.email);
+  const existingPhone = normalizePhone(existingGuest.phone);
+
+  if (candidateEmail && existingEmail && candidateEmail === existingEmail) {
+    return `Duplicate guest: email already used by ${existingGuest.firstName} ${existingGuest.lastName}`;
+  }
+
+  if (candidatePhone && existingPhone && candidatePhone === existingPhone) {
+    return `Duplicate guest: phone already used by ${existingGuest.firstName} ${existingGuest.lastName}`;
+  }
+
+  return `Duplicate guest: ${existingGuest.firstName} ${existingGuest.lastName} already exists`;
+}
+
+async function findDuplicateGuest(candidate, { excludeGuestId } = {}) {
+  const guests = await listGuests();
+
+  return guests.find((guest) => {
+    if (excludeGuestId && guest.id === excludeGuestId) {
+      return false;
+    }
+
+    return isDuplicateGuest(candidate, guest);
+  }) || null;
+}
+
+function hasDuplicateInBatch(candidate, batch) {
+  return batch.find((guest) => isDuplicateGuest(candidate, guest)) || null;
+}
+
+async function importGuestsFromRows(rows) {
+  const guests = [];
+  const skipped = [];
+
+  for (const [index, row] of rows.entries()) {
+    const guest = createGuest(row);
+    if (!guest) {
+      skipped.push({
+        row: index + 2,
+        reason: 'firstName and lastName are required',
+      });
+      continue;
+    }
+
+    const duplicateInBatch = hasDuplicateInBatch(guest, guests);
+    if (duplicateInBatch) {
+      skipped.push({
+        row: index + 2,
+        reason: formatDuplicateReason(guest, duplicateInBatch),
+      });
+      continue;
+    }
+
+    const duplicateInDatabase = await findDuplicateGuest(guest);
+    if (duplicateInDatabase) {
+      skipped.push({
+        row: index + 2,
+        reason: formatDuplicateReason(guest, duplicateInDatabase),
+      });
+      continue;
+    }
+
+    guests.push(guest);
+  }
+
+  return { guests, skipped };
 }
 
 function normalizeGuestDocument(document) {
@@ -296,8 +398,39 @@ const server = createServer(async (req, res) => {
         return;
       }
 
+      const duplicateGuest = await findDuplicateGuest(guest);
+      if (duplicateGuest) {
+        sendJson(res, 409, { error: formatDuplicateReason(guest, duplicateGuest) }, origin);
+        return;
+      }
+
       await guestsCollection.insertOne(guest);
       sendJson(res, 201, { guest }, origin);
+      return;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/guests/import') {
+      if (!requireAuth(req, res, origin)) return;
+
+      const body = await parseBody(req);
+      const rows = Array.isArray(body.guests) ? body.guests : [];
+
+      if (rows.length === 0) {
+        sendJson(res, 400, { error: 'guests must be a non-empty array' }, origin);
+        return;
+      }
+
+      const { guests, skipped } = await importGuestsFromRows(rows);
+
+      if (guests.length > 0) {
+        await guestsCollection.insertMany(guests, { ordered: false });
+      }
+
+      sendJson(res, 201, {
+        success: true,
+        imported: guests.length,
+        skipped,
+      }, origin);
       return;
     }
 
@@ -322,11 +455,18 @@ const server = createServer(async (req, res) => {
         const body = await parseBody(req);
         const patch = sanitizeGuestPayload(body, { partial: true });
         const nextPatch = {
+          ...guest,
           ...patch,
           tableNumber: patch.tableNumber === '' ? undefined : patch.tableNumber ?? guest.tableNumber,
           plusOneName: patch.plusOne === false ? undefined : patch.plusOneName ?? guest.plusOneName,
           notes: patch.notes === '' ? undefined : patch.notes ?? guest.notes,
         };
+
+        const duplicateGuest = await findDuplicateGuest(nextPatch, { excludeGuestId: guestId });
+        if (duplicateGuest) {
+          sendJson(res, 409, { error: formatDuplicateReason(nextPatch, duplicateGuest) }, origin);
+          return;
+        }
 
         const updatedGuest = await updateGuest(guestId, nextPatch);
         sendJson(res, 200, { guest: updatedGuest }, origin);
